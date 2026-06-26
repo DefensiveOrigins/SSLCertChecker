@@ -5,11 +5,21 @@ check_ssl.py — Bulk SSL Certificate Checker
 Reads a list of hosts (with optional ports) and checks each SSL certificate,
 reporting the common name, issuing CA, validity dates, and any problems found.
 
-Hosts file format (one entry per line):
+Input can be either a plain-text hosts file or a Nessus XML export (.nessus).
+The format is detected automatically from the file extension and content.
+
+Plain-text hosts file format (one entry per line):
   example.com            # defaults to port 443
   example.com:443        # explicit port
   internal-host:8443     # non-standard port
   # lines starting with # are ignored
+
+Nessus XML input (NessusClientData_v2 format):
+  Any .nessus file exported from Nessus 5.x or later is accepted.
+  SSL-enabled host:port pairs are extracted automatically by looking for
+  ReportItems whose svc_name indicates SSL/HTTPS, or that were flagged by
+  known SSL-related Nessus plugins (e.g. plugin 10863 - SSL Certificate
+  Information).  Duplicate host:port pairs are de-duplicated before scanning.
 
 Highlights:
   - Expired or not-yet-valid certificates          (red)
@@ -20,9 +30,9 @@ Highlights:
 
 Examples:
   python check_ssl.py hosts.txt
+  python check_ssl.py scan.nessus
   python check_ssl.py hosts.txt --timeout 10 --warn-days 60
-  python check_ssl.py hosts.txt --verbose
-  python check_ssl.py hosts.txt --csv report.csv
+  python check_ssl.py scan.nessus --verbose --csv report.csv
   python check_ssl.py hosts.txt --csv report.csv --no-color
 """
 
@@ -31,6 +41,7 @@ import socket
 import sys
 import csv
 import argparse
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
@@ -58,6 +69,24 @@ TRUSTED_CA_KEYWORDS = [
     "swisssign", "teliasonera", "trustwave", "t-systems", "quovadis",
     "isrg", "internet security research group",
 ]
+
+# Nessus plugin IDs that indicate an SSL/TLS service on a port.
+# 10863 = SSL Certificate Information (the primary one)
+# 56984 = SSL / TLS Versions Supported
+# 21643 = SSL Cipher Suites Supported
+# 10881 = SSL Certificate Expiry
+# 42873 = SSL Medium Strength Cipher Suites Supported
+# 83875 = SSL Certificate Chain Contains Certificates Expiring Soon
+NESSUS_SSL_PLUGIN_IDS = {
+    "10863", "56984", "21643", "10881", "42873", "83875",
+    "15901", "65821", "104743", "51192",
+}
+
+# svc_name values Nessus uses for SSL/TLS services
+NESSUS_SSL_SVC_NAMES = {
+    "www", "https", "ssl", "ftps", "smtps", "imaps", "pop3s",
+    "ldaps", "telnets", "nntps", "ircs", "urd",
+}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -276,20 +305,88 @@ def print_verbose(results: list, warn_days: int, use_color: bool) -> None:
 # ── Shared summary footer ─────────────────────────────────────────────────────
 
 def _print_summary(results: list, warn_days: int, use_color: bool) -> None:
-    issues = [
-        (r, code, label)
-        for r in results
-        for code, label in [derive_status(r, warn_days)]
-        if code != "OK"
-    ]
+    from collections import Counter
+
+    # Classify every result
+    statuses = [(r, *derive_status(r, warn_days)) for r in results]
+
+    total   = len(results)
+    errors  = [(r, code, label) for r, code, label in statuses if code == "ERROR"]
+    clean   = [(r, code, label) for r, code, label in statuses if code == "OK"]
+    flagged = [(r, code, label) for r, code, label in statuses if code not in ("OK", "ERROR")]
+
+    # Count individual flag types; a host can contribute more than one
+    # (e.g. a cert that is both expired AND self-signed counts in both buckets)
+    flag_counts: Counter = Counter()
+    FLAG_LABELS = {
+        "EXPIRED":       "Expired",
+        "NOT_YET_VALID": "Not yet valid",
+        "EXPIRING":      "Expiring soon",
+        "SELF_SIGNED":   "Self-signed",
+        "UNTRUSTED":     "Untrusted CA",
+    }
+    for r, code, label in statuses:
+        if code in ("OK", "ERROR"):
+            if code == "ERROR":
+                flag_counts["ERROR"] += 1
+            continue
+        now = datetime.now(timezone.utc)
+        if now > r["not_after"]:
+            flag_counts["EXPIRED"] += 1
+        elif now < r["not_before"]:
+            flag_counts["NOT_YET_VALID"] += 1
+        else:
+            if (r["not_after"] - now).days <= warn_days:
+                flag_counts["EXPIRING"] += 1
+        if r["self_signed"]:
+            flag_counts["SELF_SIGNED"] += 1
+        elif not r["trusted_ca"]:
+            flag_counts["UNTRUSTED"] += 1
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    sep  = c("─" * 62, CYAN, use_color=use_color)
+    sep2 = c("═" * 62, CYAN, use_color=use_color)
     print()
-    if not issues:
+    print(sep2)
+    print(c("  SCAN SUMMARY", BOLD, use_color=use_color))
+    print(sep)
+
+    # ── Totals block ──────────────────────────────────────────────────────────
+    print(f"  {'Total hosts scanned':<30} {total:>4}")
+    print(c(f"  {'  No issues (healthy)':<30} {len(clean):>4}",
+            GREEN, use_color=use_color))
+    err_color  = (RED, BOLD) if errors  else ()
+    flag_color = (YELLOW, BOLD) if flagged else ()
+    print(c(f"  {'  Errors / unreachable':<30} {len(errors):>4}",
+            *err_color,  use_color=use_color))
+    print(c(f"  {'  Flagged (cert issues)':<30} {len(flagged):>4}",
+            *flag_color, use_color=use_color))
+
+    # ── Flag-type breakdown ───────────────────────────────────────────────────
+    if flag_counts:
+        print(sep)
+        print(c("  Flag breakdown:", BOLD, use_color=use_color))
+        for key in ["EXPIRED", "NOT_YET_VALID", "EXPIRING", "SELF_SIGNED", "UNTRUSTED", "ERROR"]:
+            if key not in flag_counts:
+                continue
+            colors = STATUS_COLOR.get(key, ())
+            lbl    = FLAG_LABELS.get(key, key)
+            print(c(f"    {lbl:<28} {flag_counts[key]:>4}", *colors, use_color=use_color))
+
+    # ── Per-host list of anything needing attention ───────────────────────────
+    all_issues = errors + flagged
+    if all_issues:
+        print(sep)
+        print(c("  Hosts requiring attention:", BOLD, use_color=use_color))
+        for r, code, label in all_issues:
+            colors   = STATUS_COLOR.get(code, ())
+            host_str = f"{r['host']}:{r['port']}"
+            print(c(f"    • {host_str:<38} {label}", *colors, use_color=use_color))
+
+    print(sep2)
+    if not all_issues:
         print(c("  ✓  All certificates are healthy.", GREEN, BOLD, use_color=use_color))
-    else:
-        print(c(f"  ⚠  {len(issues)} issue(s) found:", YELLOW, BOLD, use_color=use_color))
-        for r, code, label in issues:
-            colors = STATUS_COLOR.get(code, ())
-            print(c(f"     • {r['host']}:{r['port']}  →  {label}", *colors, use_color=use_color))
+        print(sep2)
     print()
 
 
@@ -317,9 +414,10 @@ def write_csv(results: list, path: str, warn_days: int) -> None:
             })
 
 
-# ── Hosts file parser ─────────────────────────────────────────────────────────
+# ── Input parsers ─────────────────────────────────────────────────────────────
 
 def parse_hosts_file(path: str) -> list[tuple[str, int]]:
+    """Parse a plain-text file of host[:port] entries."""
     hosts = []
     with open(path) as fh:
         for lineno, raw in enumerate(fh, 1):
@@ -340,6 +438,109 @@ def parse_hosts_file(path: str) -> list[tuple[str, int]]:
     return hosts
 
 
+def parse_nessus_file(path: str) -> list[tuple[str, int]]:
+    """
+    Parse a Nessus XML (NessusClientData_v2) export and return unique
+    (host, port) pairs for every SSL/TLS service found.
+
+    Detection strategy (OR logic — a ReportItem is included if any match):
+      1. svc_name attribute is in NESSUS_SSL_SVC_NAMES  (www, https, ssl, …)
+      2. pluginID is in NESSUS_SSL_PLUGIN_IDS           (10863, 56984, …)
+      3. port is 443 or 8443                            (common HTTPS defaults)
+    """
+    try:
+        tree = ET.parse(path)
+    except ET.ParseError as exc:
+        print(f"Failed to parse Nessus XML: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    root = tree.getroot()
+
+    # Accept both <NessusClientData_v2> root and files wrapped differently
+    if root.tag not in ("NessusClientData_v2", "NessusClientData"):
+        print(
+            f"Warning: unexpected root element <{root.tag}>. "
+            "File may not be a valid Nessus export; attempting to parse anyway.",
+            file=sys.stderr,
+        )
+
+    seen:  set[tuple[str, int]] = set()
+    hosts: list[tuple[str, int]] = []
+
+    for report_host in root.iter("ReportHost"):
+        hostname = report_host.get("name", "").strip()
+        if not hostname:
+            continue
+
+        # Prefer the resolved FQDN/IP stored in HostProperties if present
+        for tag in report_host.findall("HostProperties/tag"):
+            if tag.get("name") in ("host-fqdn", "host-ip"):
+                val = (tag.text or "").strip()
+                if val:
+                    hostname = val
+                    break
+
+        for item in report_host.findall("ReportItem"):
+            port_str  = item.get("port",      "0")
+            svc_name  = item.get("svc_name",  "").lower()
+            plugin_id = item.get("pluginID",  "")
+            protocol  = item.get("protocol",  "tcp").lower()
+
+            # Only TCP services carry SSL
+            if protocol != "tcp":
+                continue
+
+            try:
+                port = int(port_str)
+            except ValueError:
+                continue
+
+            if port == 0:
+                continue
+
+            ssl_by_svc    = svc_name  in NESSUS_SSL_SVC_NAMES
+            ssl_by_plugin = plugin_id in NESSUS_SSL_PLUGIN_IDS
+            ssl_by_port   = port in (443, 8443)
+
+            if ssl_by_svc or ssl_by_plugin or ssl_by_port:
+                key = (hostname, port)
+                if key not in seen:
+                    seen.add(key)
+                    hosts.append(key)
+
+    return hosts
+
+
+def is_nessus_file(path: str) -> bool:
+    """
+    Return True if the file looks like a Nessus XML export.
+    Checks the extension first, then peeks at the file content.
+    """
+    if path.lower().endswith(".nessus"):
+        return True
+    # Peek at the first 512 bytes for the XML signature
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(512).decode("utf-8", errors="ignore")
+        return "NessusClientData" in head
+    except OSError:
+        return False
+
+
+def load_hosts(path: str, use_color: bool) -> list[tuple[str, int]]:
+    """Auto-detect input format and return (host, port) list."""
+    if is_nessus_file(path):
+        print(c("  Input format : Nessus XML", CYAN, use_color=use_color))
+        hosts = parse_nessus_file(path)
+        print(c(f"  SSL targets  : {len(hosts)} unique host:port pair(s) extracted\n",
+                CYAN, use_color=use_color))
+    else:
+        print(c("  Input format : plain-text hosts file", CYAN, use_color=use_color))
+        hosts = parse_hosts_file(path)
+        print(c(f"  Hosts loaded : {len(hosts)}\n", CYAN, use_color=use_color))
+    return hosts
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -349,12 +550,15 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "hosts_file",
-        metavar="HOSTS_FILE",
+        "input_file",
+        metavar="INPUT_FILE",
         help=(
-            "Path to a plain-text file containing one host per line.  "
-            "Entries may be 'hostname' (port defaults to 443) or "
-            "'hostname:port'.  Lines beginning with '#' are ignored."
+            "Path to either a plain-text hosts file or a Nessus XML export "
+            "(.nessus).  Format is detected automatically.  "
+            "Plain-text entries may be 'hostname' (port defaults to 443) or "
+            "'hostname:port'; lines beginning with '#' are ignored.  "
+            "Nessus files are parsed for SSL/TLS service findings and all "
+            "unique host:port pairs are scanned."
         ),
     )
     parser.add_argument(
@@ -425,19 +629,25 @@ def main() -> None:
 
     use_color = not args.no_color and sys.stdout.isatty()
 
+    print()
+
     try:
-        hosts = parse_hosts_file(args.hosts_file)
+        hosts = load_hosts(args.input_file, use_color)
     except FileNotFoundError:
-        print(f"File not found: {args.hosts_file}", file=sys.stderr)
+        print(f"File not found: {args.input_file}", file=sys.stderr)
         sys.exit(1)
 
     if not hosts:
-        print("No valid host entries found in the file.", file=sys.stderr)
+        print(
+            "No SSL/TLS host:port entries found in the input file.\n"
+            "For Nessus files, ensure the scan included SSL-related plugins "
+            "(e.g. plugin 10863) or targeted ports 443/8443.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # ── Scan with alive-progress bar ──────────────────────────────────────────
     results = []
-    print()
     with alive_bar(
         len(hosts),
         title="Checking certificates",
@@ -445,8 +655,8 @@ def main() -> None:
         spinner="classic",
         elapsed=True,
         stats=True,
-        enrich_print=False,       # don't prepend bar position to print() calls
-        receipt=True,             # show completion receipt when done
+        enrich_print=False,
+        receipt=True,
     ) as bar:
         for host, port in hosts:
             bar.text(f"→ {host}:{port}")

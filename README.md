@@ -1,6 +1,3 @@
-# SSLCertChecker
-quick checks for SSL Certificates
-
 # check_ssl.py — Bulk SSL Certificate Checker
 
 A command-line tool that reads a list of hostnames and checks the SSL/TLS
@@ -12,23 +9,73 @@ dates, and a colour-coded status for any problems found.
 ## Requirements
 
 - Python 3.10 or later
-- [`cryptography`](https://pypi.org/project/cryptography/) package
+- [`cryptography`](https://pypi.org/project/cryptography/) — certificate parsing
+- [`alive-progress`](https://pypi.org/project/alive-progress/) — animated progress bar
 
-Install the dependency with:
+All other imports (`ssl`, `socket`, `csv`, `argparse`, `xml.etree.ElementTree`, `datetime`) are part of the Python standard library and require no installation.
+
+---
+
+## Installation
+
+Running inside a virtual environment is recommended so the dependencies stay isolated from your system Python. The steps are the same on macOS and Linux; Windows users should swap `python3` for `py -3` and use backslashes where noted.
+
+### Option A — Virtual environment (recommended)
 
 ```bash
-pip install cryptography
+# 1. Clone or download the project files into a directory
+#    (check_ssl.py and requirements.txt must be in the same folder)
+
+# 2. Create a virtual environment in that directory
+python3 -m venv .venv
+
+# 3. Activate it
+#    macOS / Linux:
+source .venv/bin/activate
+#    Windows (Command Prompt):
+.venv\Scripts\activate.bat
+#    Windows (PowerShell):
+.venv\Scripts\Activate.ps1
+
+# 4. Install dependencies from the requirements file
+pip install -r requirements.txt
+
+# 5. Run the tool
+python check_ssl.py hosts.txt
 ```
 
-No other third-party packages are required. All networking and TLS primitives
-use Python's standard library (`ssl`, `socket`).
+The virtual environment only needs to be **created once** (steps 2 and 4). On subsequent uses just activate it (step 3) and run.
+
+To deactivate the environment when you are done:
+
+```bash
+deactivate
+```
+
+### Option B — System-wide install
+
+If you prefer not to use a virtual environment, install the dependencies directly:
+
+```bash
+pip install -r requirements.txt
+```
+
+Or install packages individually:
+
+```bash
+pip install cryptography alive-progress
+```
 
 ---
 
 ## Quick Start
 
 ```bash
+# Plain-text hosts file
 python check_ssl.py hosts.txt
+
+# Nessus XML export
+python check_ssl.py scan.nessus
 ```
 
 ---

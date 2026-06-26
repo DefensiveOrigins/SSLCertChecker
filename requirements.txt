@@ -1,0 +1,15 @@
+# requirements.txt — check_ssl.py
+#
+# Install all dependencies with:
+#   pip install -r requirements.txt
+#
+# Requires Python 3.10 or later.
+# All other imports (ssl, socket, csv, argparse, xml.etree.ElementTree,
+# datetime) are part of the Python standard library and need no installation.
+ 
+# SSL/TLS certificate parsing
+cryptography>=41.0,<47
+ 
+# Animated progress bar
+alive-progress>=3.1,<4
+ 
